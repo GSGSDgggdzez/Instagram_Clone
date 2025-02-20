@@ -7,6 +7,7 @@ import (
 	"API/internal/utils"
 	"context"
 	"errors"
+	"fmt"
 	"html"
 	"log"
 	"mime/multipart"
@@ -33,7 +34,7 @@ func NewAuthController(db database.Service) *AuthController {
 }
 
 var (
-	registerLimiter = rate.NewLimiter(rate.Every(1*time.Minute), 120)
+	Limiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 100) // More permissive for bursts
 )
 
 // --------------------------------------------------------------------------------------------------
@@ -55,7 +56,7 @@ type RegisterRequest struct {
 func (ac *AuthController) Register(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if !registerLimiter.Allow() {
+	if !Limiter.Allow() {
 		return utils.SendErrorResponse(c, fiber.StatusTooManyRequests, "Too many registration attempts", nil)
 	}
 
@@ -68,57 +69,67 @@ func (ac *AuthController) Register(c *fiber.Ctx) error {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Validation failed", utils.FormatValidationErrors(err))
 	}
 
-	file, err := c.FormFile("avatar")
-	if err != nil {
-		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Profile picture is required", err.Error())
-	}
-
-	// Create upload channel
 	uploadChan := make(chan struct {
 		url string
 		err error
 	})
 
-	// Get Cloudinary instance before goroutine
-	cld, err := config.InitCloudinary()
+	var avatarURL string
+
+	file, err := c.FormFile("avatar")
+
 	if err != nil {
-		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to initialize Cloudinary", err.Error())
+		avatarURL = utils.GetDefaultAvatar()
+	} else {
+		// Get Cloudinary instance before goroutine
+		cld, err := config.InitCloudinary()
+		if err != nil {
+			return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to initialize Cloudinary", err.Error())
+		}
+
+		go func(file *multipart.FileHeader) {
+			var result struct {
+				url string
+				err error
+			}
+
+			if err := utils.ValidateImageFile(file); err != nil {
+				result.err = err
+				uploadChan <- result
+				return
+			}
+
+			fileHeader, err := file.Open()
+			if err != nil {
+				result.err = err
+				uploadChan <- result
+				return
+			}
+			defer fileHeader.Close()
+
+			url, err := utils.UploadToCloudinary(cld, ctx, fileHeader)
+			if err != nil {
+				result.err = err
+				uploadChan <- result
+				return
+			}
+
+			result.url = url
+			uploadChan <- result
+
+		}(file)
+
+		uploadResult := <-uploadChan
+		if uploadResult.err != nil {
+			return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to upload image", uploadResult.err.Error())
+		}
+		avatarURL = uploadResult.url
 	}
 
 	// Use the existing context
 	// ctx := context.Background()
 
 	// Handle upload in goroutine
-	go func(file *multipart.FileHeader) {
-		var result struct {
-			url string
-			err error
-		}
-
-		if err := utils.ValidateImageFile(file); err != nil {
-			result.err = err
-			uploadChan <- result
-			return
-		}
-
-		fileHeader, err := file.Open()
-		if err != nil {
-			result.err = err
-			uploadChan <- result
-			return
-		}
-		defer fileHeader.Close()
-
-		url, err := utils.UploadToCloudinary(cld, ctx, fileHeader)
-		if err != nil {
-			result.err = err
-			uploadChan <- result
-			return
-		}
-
-		result.url = url
-		uploadChan <- result
-	}(file)
 
 	token, err := utils.GenerateVerificationToken()
 	if err != nil {
@@ -130,18 +141,13 @@ func (ac *AuthController) Register(c *fiber.Ctx) error {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to hash password", err.Error())
 	}
 
-	// Wait for upload result
-	uploadResult := <-uploadChan
-	if uploadResult.err != nil {
-		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to upload image", uploadResult.err.Error())
-	}
-
 	createUserData := models.User{
 		Name:     html.EscapeString(req.Name),
 		Email:    html.EscapeString(req.Email),
 		Password: string(hashedPassword),
 		Bio:      html.EscapeString(req.Bio),
-		Avatar:   uploadResult.url,
+		Avatar:   avatarURL,
+		// Avatar:   utils.GetDefaultAvatar(), // HERE'S THE FIRE ADDITION! 🔥
 		Website:  html.EscapeString(req.Website),
 		Phone:    html.EscapeString(req.Phone),
 		Language: html.EscapeString(req.Language),
@@ -159,6 +165,10 @@ func (ac *AuthController) Register(c *fiber.Ctx) error {
 		// Retry mechanism for user creation
 		for attempts := 1; attempts <= 3; attempts++ {
 			userPtr, err = ac.db.CreateUser(createUserData)
+			go func() {
+				utils.TrackRegistration(req.Email, true, attempts)
+			}()
+
 			if err == nil {
 				break
 			}
@@ -170,11 +180,11 @@ func (ac *AuthController) Register(c *fiber.Ctx) error {
 		newUser = *userPtr
 
 		// Send verification email asynchronously
-		go func() {
-			if err := utils.SendVerificationEmail(newUser.Email, newUser.Token); err != nil {
-				log.Printf("Failed to send verification email: %v", err)
-			}
-		}()
+		// go func() {
+		// 	if err := utils.SendVerificationEmail(newUser.Email, newUser.Token); err != nil {
+		// 		log.Printf("Failed to send verification email: %v", err)
+		// 	}
+		// }()
 
 		return nil
 	})
@@ -188,6 +198,7 @@ func (ac *AuthController) Register(c *fiber.Ctx) error {
 		"status":  fiber.StatusCreated,
 		"userID":  newUser.Email,
 	})
+
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -195,34 +206,45 @@ func (ac *AuthController) Register(c *fiber.Ctx) error {
 // --------------------------------------------------------------------------------------------------
 
 func (ac *AuthController) VerifyEmail(c *fiber.Ctx) error {
-	Badtoken := c.Params("token")
+	GodTOken := html.EscapeString(c.Params("token"))
 
-	GodTOken := html.EscapeString(Badtoken)
+	var updateResult models.User
+	err := ac.db.GetDB().Transaction(func(tx *gorm.DB) error {
+		var err error
+		var userPtr *models.User
 
-	updateResult, err := ac.db.VerifyUserAndUpdate(GodTOken)
+		for attempts := 1; attempts <= 3; attempts++ {
+			userPtr, err = ac.db.VerifyUserAndUpdate(GodTOken)
+			utils.TrackFindUserByToken(userPtr.Email, true, attempts)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second * time.Duration(attempts))
+		}
+		if err != nil {
+			return err
+		}
+
+		updateResult = *userPtr
+
+		return nil
+	})
 
 	if err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Bad Verification token", err.Error())
 	}
 
-	JWT, err := utils.GenerateToken(int(updateResult.ID), updateResult.Avatar, updateResult.Email, updateResult.Name, updateResult.Token, updateResult.Bio, updateResult.EmailVerified, updateResult.FollowerCount, updateResult.FollowingCount)
-
+	JWT, err := utils.GenerateToken(updateResult.ID, updateResult.Email, updateResult.Name, updateResult.Username, updateResult.Avatar, updateResult.Token, updateResult.Bio, updateResult.Website, updateResult.Phone, updateResult.Language, updateResult.EmailVerified, updateResult.Privacy, updateResult.EmailVerified, updateResult.FollowingCount, updateResult.FollowerCount)
 	if err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to generate JWT token", err.Error())
 	}
 
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
-
 		"detail": "User have been verify successfully",
 		"status": fiber.StatusOK,
 		"JWT":    JWT,
 		"user": fiber.Map{
-			"id":         updateResult.ID,
-			"email":      updateResult.Email,
-			"Name":       updateResult.Name,
-			"profileUrl": updateResult.Avatar,
-			"IsVerified": updateResult.EmailVerified,
-			"Bio":        updateResult.Bio,
+			"User": updateResult,
 		},
 	})
 }
@@ -236,12 +258,16 @@ func (ac *AuthController) VerifyEmail(c *fiber.Ctx) error {
 // --------------------------------------------------------------------------------------------------
 
 type LoginRequest struct {
-	Email    string `json:"email" validate:"required,email"` // Must be a valid email
-	Password string `json:"password" validate:"required"`    // Cannot be empty
+	Email    string `json:"email" validate:"required,email,max=255"`    // Must be a valid email
+	Password string `json:"password" validate:"required,max=255,min=8"` // Cannot be empty
 }
 
 func (ac *AuthController) Login(c *fiber.Ctx) error {
 	var req LoginRequest
+
+	if !Limiter.Allow() {
+		return utils.SendErrorResponse(c, fiber.StatusTooManyRequests, "Too many registration attempts", nil)
+	}
 
 	if err := c.BodyParser(&req); err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Invalid form data", err.Error())
@@ -251,7 +277,25 @@ func (ac *AuthController) Login(c *fiber.Ctx) error {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Validation failed", utils.FormatValidationErrors(err))
 	}
 
-	user, err := ac.db.FindUserByEmail(html.EscapeString(req.Email))
+	var user *models.User
+	err := ac.db.GetDB().Transaction(func(tx *gorm.DB) error {
+		var err error
+
+		for attempts := 1; attempts <= 3; attempts++ {
+			user, err = ac.db.FindUserByEmail(html.EscapeString(req.Email))
+			utils.TrackFindUserByEMAIL(req.Email, true, attempts)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second * time.Duration(attempts))
+		}
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 
 	if err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Error during login", utils.FormatValidationErrors(err))
@@ -260,25 +304,18 @@ func (ac *AuthController) Login(c *fiber.Ctx) error {
 	if user == nil {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Error during login", utils.FormatValidationErrors(err))
 	}
-
-	JWT, err := utils.GenerateToken(int(user.ID), user.Avatar, user.Email, user.Name, user.Token, user.Bio, user.EmailVerified, user.FollowerCount, user.FollowingCount)
+	JWT, err := utils.GenerateToken(user.ID, user.Email, user.Name, user.Username, user.Avatar, user.Token, user.Bio, user.Website, user.Phone, user.Language, user.EmailVerified, user.Privacy, user.EmailVerified, user.FollowingCount, user.FollowerCount)
 
 	if err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to generate JWT token", err.Error())
 	}
 
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
-
 		"detail": "User have been verify successfully",
 		"status": fiber.StatusOK,
 		"JWT":    JWT,
 		"user": fiber.Map{
-			"id":         user.ID,
-			"email":      user.Email,
-			"Name":       user.Name,
-			"profileUrl": user.Avatar,
-			"Bio":        user.Bio,
-			"IsVerified": user.EmailVerified,
+			"User": user,
 		},
 	})
 }
@@ -298,6 +335,10 @@ type ForgotPasswordRequest struct {
 func (ac *AuthController) ForgotPassword(c *fiber.Ctx) error {
 	var req ForgotPasswordRequest
 
+	if !Limiter.Allow() {
+		return utils.SendErrorResponse(c, fiber.StatusTooManyRequests, "Too many registration attempts", nil)
+	}
+
 	if err := c.BodyParser(&req); err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Invalid form data", err.Error())
 	}
@@ -306,7 +347,25 @@ func (ac *AuthController) ForgotPassword(c *fiber.Ctx) error {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Validation failed", utils.FormatValidationErrors(err))
 	}
 
-	findUser, err := ac.db.FindUserByEmail(req.Email)
+	var user *models.User
+	err := ac.db.GetDB().Transaction(func(tx *gorm.DB) error {
+		var err error
+
+		for attempts := 1; attempts <= 3; attempts++ {
+			user, err = ac.db.FindUserByEmail(html.EscapeString(req.Email))
+			utils.TrackFindUserByEMAIL(req.Email, true, attempts)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second * time.Duration(attempts))
+		}
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to check user existence", err.Error())
@@ -314,13 +373,13 @@ func (ac *AuthController) ForgotPassword(c *fiber.Ctx) error {
 
 	go func() {
 		// Assume you have a function that sends the email
-		err := utils.SendVerificationPassword(findUser.Email, findUser.Token)
+		err := utils.SendVerificationPassword(user.Email, user.Token)
 		if err != nil {
 			// Return an error response if sending the verification email fails.
 			c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error":  "Failed to send verification email", // Error message.
 				"status": fiber.StatusInternalServerError,     // Internal server error status code.
-				"TO":     findUser.Email,
+				"TO":     user.Email,
 			})
 		}
 	}()
@@ -340,21 +399,39 @@ func (ac *AuthController) ForgotPassword(c *fiber.Ctx) error {
 // ------------------------------------------------------------------------------------------------------------
 
 func (ac *AuthController) RestPassword(c *fiber.Ctx) error {
-	Token := c.Params("Token")
 
-	FindToken, err := ac.db.FindUserByToken(html.EscapeString(Token))
+	Token := html.EscapeString(c.Params("Token"))
+
+	var user *models.User
+	err := ac.db.GetDB().Transaction(func(tx *gorm.DB) error {
+		var err error
+
+		for attempts := 1; attempts <= 3; attempts++ {
+			user, err = ac.db.FindUserByToken(Token)
+			utils.TrackFindUserByToken(user.Email, true, attempts)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second * time.Duration(attempts))
+		}
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 
 	if err != nil && err != gorm.ErrRecordNotFound {
 		// Return an error response if there is an error other than record not found.
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Invalid form data", err.Error())
 	}
 
-	if FindToken == nil {
+	if user == nil {
 		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Invalid form data", err.Error())
 	}
 
-	JWT, err := utils.GenerateToken(int(FindToken.ID), FindToken.Avatar, FindToken.Email, FindToken.Name, FindToken.Token, FindToken.Bio, FindToken.EmailVerified, FindToken.FollowerCount, FindToken.FollowingCount)
-
+	JWT, err := utils.GenerateToken(user.ID, user.Email, user.Name, user.Username, user.Avatar, user.Token, user.Bio, user.Website, user.Phone, user.Language, user.EmailVerified, user.Privacy, user.EmailVerified, user.FollowingCount, user.FollowerCount)
 	if err != nil {
 		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to generate JWT token", err.Error())
 	}
@@ -364,16 +441,13 @@ func (ac *AuthController) RestPassword(c *fiber.Ctx) error {
 		"status": fiber.StatusOK,
 		"JWT":    JWT,
 		"user": fiber.Map{
-			"id":         FindToken.ID,
-			"email":      FindToken.Email,
-			"Name":       FindToken.Name,
-			"profileUrl": FindToken.Avatar,
+			"User": user,
 		},
 	})
 
 }
 
-// ------------------------------------------------------------------------------------------------------------
+// ----------------------------------- -------------------------------------------------------------------------
 // ------------------------------ these is the End of the RestPasswordRequest logic -------------------------
 // ------------------------------------------------------------------------------------------------------------
 
@@ -381,67 +455,90 @@ func (ac *AuthController) RestPassword(c *fiber.Ctx) error {
 // ------------------------------ these is the Start of the DeleteRequest logic -------------------------
 // ------------------------------------------------------------------------------------------------------------
 
+// DeleteUser - Clean and secure user deletion
 func (ac *AuthController) DeleteUser(c *fiber.Ctx) error {
 	claims, ok := c.Locals("user").(*utils.Claims)
 	if !ok || claims == nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error":  "Invalid or missing authentication",
-			"status": fiber.StatusUnauthorized,
-		})
+		return utils.SendErrorResponse(c, fiber.StatusUnauthorized, "Invalid or missing authentication", nil)
 	}
 
-	ID := c.Params("ID")
-	claimsID := strconv.Itoa(claims.UserID)
+	ID := html.EscapeString(c.Params("ID"))
 
-	if claimsID != ID {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error":  "You are not authorized to delete this account",
-			"status": fiber.StatusBadRequest,
-		})
+	if claims.ID != ID {
+		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "You are not authorized to delete this account", nil)
 	}
 
 	// Convert string ID to uint
-	userID, err := strconv.ParseUint(claimsID, 10, 32)
+	userID, err := strconv.ParseUint(claims.ID, 10, 32)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error":  "Invalid user ID format",
-			"status": fiber.StatusBadRequest,
-			"detail": "User ID must be a positive number",
-		})
+		return utils.SendErrorResponse(c, fiber.StatusBadRequest, "Invalid user ID format", err.Error())
 	}
 
-	deleteUser, err := ac.db.FindUserById(uint(userID))
+	// deleteUser, err := ac.db.FindUserById(uint(userID))
+
+	var deleteUser *models.User
+	err = ac.db.GetDB().Transaction(func(tx *gorm.DB) error {
+		var err error
+
+		for attempts := 1; attempts <= 3; attempts++ {
+			deleteUser, err = ac.db.FindUserById(uint(userID))
+			utils.TrackFindUserByID(claims.Email, true, attempts)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second * time.Duration(attempts))
+		}
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-				"error":  "User not found",
-				"status": fiber.StatusNotFound,
-				"detail": "The requested user does not exist",
-			})
+			return utils.SendErrorResponse(c, fiber.StatusNotFound, "User not found", nil)
 		}
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error":  "Database error",
-			"status": fiber.StatusInternalServerError,
-			"detail": err.Error(),
-		})
+		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Database error", err.Error())
 	}
 
 	if deleteUser == nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error":  "User not found",
-			"status": fiber.StatusNotFound,
-		})
+		return utils.SendErrorResponse(c, fiber.StatusNotFound, "User not found", nil)
 	}
 
-	// Delete the user from the database first
-	Delete, err := ac.db.DeleteUser(claimsID)
+	// Create notifications for followers before deletion
+	notification := models.Notification{
+		From:     deleteUser.ID,
+		To:       deleteUser.ID, // We'll update this for each follower
+		Type:     "account_deletion",
+		Context:  fmt.Sprintf("%s has deleted their account", deleteUser.Username),
+		Priority: 1,
+		GroupID:  fmt.Sprintf("deletion_%d", deleteUser.ID),
+	}
+
+	var Delete *models.User
+	// Transaction to handle deletion and notifications
+	err = ac.db.GetDB().Transaction(func(tx *gorm.DB) error {
+		// Create notifications for followers
+		for attempts := 1; attempts <= 3; attempts++ {
+			_, err := ac.db.CreateNotification(*deleteUser, notification)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second * time.Duration(attempts))
+		}
+
+		// Proceed with user deletion
+		_, err := ac.db.DeleteUser(claims.ID)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error":  "Failed to delete user from database",
-			"status": fiber.StatusInternalServerError,
-			"detail": err.Error(),
-			"User":   Delete.Name,
-		})
+		return utils.SendErrorResponse(c, fiber.StatusInternalServerError, "Failed to delete user", err.Error())
 	}
 
 	// Handle avatar deletion in background if it exists
@@ -468,9 +565,7 @@ func (ac *AuthController) DeleteUser(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message": "User successfully deleted",
 		"user": fiber.Map{
-			"id":    deleteUser.ID,
-			"email": deleteUser.Email,
-			"name":  deleteUser.Name,
+			"User": Delete,
 		},
 	})
 }

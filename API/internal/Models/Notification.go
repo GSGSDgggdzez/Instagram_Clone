@@ -27,9 +27,10 @@ type Notification struct {
 	Type      NotificationType `gorm:"not null;size:20"`
 	Context   string           `gorm:"type:text"`
 	Read      bool             `gorm:"default:false"`
-	Priority  int              `gorm:"default:0"` // 0: normal, 1: important, 2: urgent
-	GroupID   string           `gorm:"index"`     // For grouping similar notifications
+	Priority  int              `gorm:"default:0"`
+	GroupID   string           `gorm:"index"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	User      User `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
+	UserID    uint `gorm:"not null"` // Add this
+	User      User `gorm:"foreignKey:UserID"`
 }

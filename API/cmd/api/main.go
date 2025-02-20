@@ -3,6 +3,7 @@ package main
 import (
 	"API/internal/database"
 	"API/internal/server"
+	"API/internal/utils"
 	"context"
 	"fmt"
 	"log"
@@ -63,6 +64,10 @@ func main() {
 			panic(fmt.Sprintf("http server error: %s", err))
 		}
 	}()
+
+	if err := utils.InitAnalytics(); err != nil {
+		log.Fatal("Failed to initialize analytics:", err)
+	}
 
 	// Run graceful shutdown in a separate goroutine
 	go gracefulShutdown(server, done)

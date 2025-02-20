@@ -31,6 +31,7 @@ type Service interface {
 	FindUserById(id uint) (*models.User, error)
 	//-----------------------Create ------------------------
 	CreateUser(user models.User) (*models.User, error)
+	CreateNotification(user models.User, notification models.Notification) (*models.User, error)
 	// --------------------Verify --------------------------
 	VerifyUserAndUpdate(token string) (*models.User, error)
 	// --------------------Delete---------------------------
@@ -102,6 +103,25 @@ func (s *service) CreateUser(user models.User) (*models.User, error) {
 	return newUser, nil
 }
 
+func (s *service) CreateNotification(user models.User, notification models.Notification) (*models.User, error) {
+	NewNotification := &models.Notification{
+		From:     notification.From,
+		To:       notification.To,
+		Type:     notification.Type,
+		Context:  notification.Context,
+		Priority: notification.Priority,
+		GroupID:  notification.GroupID,
+		Read:     false,
+	}
+
+	result := s.db.Create(NewNotification)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	return &user, nil
+}
+
 // --------------------------------------------------------------
 // --------------------------- VerifyUserAndUpdate ------------------------------
 // --------------------------------------------------------------
@@ -146,8 +166,21 @@ func (s *service) DeleteUser(id string) (*models.User, error) {
 		return nil, result.Error
 	}
 
-	// Delete the user
-	if err := s.db.Select("Post").Delete(&user).Error; err != nil {
+	// Delete all related data using Select
+	if err := s.db.Select([]string{
+		"Posts",
+		"Likes",
+		"Comments",
+		"Stories",
+		"Highlights",
+		"SavedPosts",
+		"Follows",
+	}).Delete(&user).Error; err != nil {
+		return nil, err
+	}
+
+	// Clean up any follows where this user is being followed
+	if err := s.db.Where("followed_id = ?", id).Delete(&models.Follow{}).Error; err != nil {
 		return nil, err
 	}
 
@@ -190,13 +223,25 @@ func New() Service {
 	if dbInstance != nil {
 		return dbInstance
 	}
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s search_path=%s", host, username, password, database, port, sslmode, schema)
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s search_path=%s pool_max_conns=25 pool_min_conns=5", host, username, password, database, port, sslmode, schema)
+
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
+		PrepareStmt:            true,
+		SkipDefaultTransaction: true, // Speed boost!
+		Logger:                 logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(25) // More realistic
+	sqlDB.SetMaxIdleConns(50) // Better idle count
+	sqlDB.SetConnMaxLifetime(time.Minute * 5)
+
 	dbInstance = &service{
 		db: db,
 	}
@@ -209,6 +254,11 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.Like{},
 		&models.Post{},
 		&models.Comment{},
+		&models.Story{},
+		&models.Highlight{},
+		&models.Follow{},
+		&models.Notification{},
+		&models.Hashtag{},
 	)
 }
 

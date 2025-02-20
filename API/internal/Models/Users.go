@@ -11,7 +11,7 @@ type User struct {
 	ID             uint        `gorm:"primaryKey;autoIncrement"`
 	Username       string      `gorm:"unique;not null;size:30"` // Instagram-style username
 	Name           string      `gorm:"not null;size:255"`
-	Avatar         string      `gorm:"not null;size:255"`
+	Avatar         string      `gorm:"size:255;default:'https://res.cloudinary.com/difubp42o/image/upload/v1738815446/tiktok-clone/zuklvs37gmezb5d0zzr6.jpg'"`
 	Bio            string      `gorm:"size:150"` // Instagram bio limit
 	Website        string      `gorm:"size:255"`
 	Email          string      `gorm:"unique;not null"`

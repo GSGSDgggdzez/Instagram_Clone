@@ -1,6 +1,8 @@
 package utils
 
 import (
+	models "API/internal/Models"
+	"API/internal/config"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -13,6 +15,12 @@ import (
 	"github.com/go-playground/validator"
 	"github.com/gofiber/fiber/v2"
 )
+
+const DefaultAvatar = "https://res.cloudinary.com/difubp42o/image/upload/v1709913547/default_avatar_rlryxo.png"
+
+func GetDefaultAvatar() string {
+	return DefaultAvatar
+}
 
 func SendErrorResponse(c *fiber.Ctx, status int, message string, details interface{}) error {
 	response := fiber.Map{"error": message, "status": status}
@@ -40,10 +48,16 @@ func GenerateVerificationToken() (string, error) {
 func FormatValidationErrors(err error) map[string]string {
 	errors := make(map[string]string)
 
-	for _, err := range err.(validator.ValidationErrors) {
-		field := err.Field()
-		tag := err.Tag()
-		errors[field] = formatErrorMessage(field, tag)
+	// Check if it's a validation error
+	if validationErrors, ok := err.(validator.ValidationErrors); ok {
+		for _, err := range validationErrors {
+			field := err.Field()
+			tag := err.Tag()
+			errors[field] = formatErrorMessage(field, tag)
+		}
+	} else {
+		// Handle non-validation errors
+		errors["general"] = err.Error()
 	}
 
 	return errors
@@ -67,6 +81,10 @@ func formatErrorMessage(field, tag string) string {
 }
 
 func ValidateImageFile(file *multipart.FileHeader) error {
+
+	if file == nil {
+		return nil // Allow nil files
+	}
 	// Get file extension
 	ext := strings.ToLower(filepath.Ext(file.Filename))
 
@@ -175,4 +193,27 @@ func ProcessHashtags(tags []string) []string {
 		}
 	}
 	return processedTags
+}
+
+func CleanupUserAssets(user *models.User) error {
+	// Initialize Cloudinary client
+	cld, err := config.InitCloudinary()
+	if err != nil {
+		return fmt.Errorf("failed to initialize cloudinary: %v", err)
+	}
+
+	// Delete user avatar
+	if user.Avatar != "" {
+		publicID, err := ExtractPublicID(user.Avatar)
+		if err == nil {
+			DeleteImageFromCloudinary(cld, publicID)
+		}
+	}
+
+	// Delete user posts and their images
+	// This would need to be implemented based on your post storage structure
+
+	// Delete any other user-related files or resources
+
+	return nil
 }

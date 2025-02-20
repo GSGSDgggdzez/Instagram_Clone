@@ -12,29 +12,41 @@ import (
 var secretKey = []byte("your-secret-key-here") // In production, use environment variable
 
 type Claims struct {
-	UserID         int    `json:"user_ID"`
+	UserID         uint   `json:"user_ID"`
 	Email          string `json:"email"`
 	Name           string `json:"name"`
 	Avatar         string `json:"avatar"`
 	JWTToken       string `json:"token"`
 	Bio            string `json:"bio"`
 	IsVerified     bool   `json:"is_verified"`
-	FollowerCount  uint   `json:"follower_count"`
-	FollowingCount uint   `json:"following_count"`
+	FollowerCount  int    `json:"follower_count"`
+	FollowingCount int    `json:"following_count"`
+	Username       string `json:"username"`
+	Phone          string `json:"phone"`
+	Website        string `json:"website"`
+	Privacy        bool   `json:"privacy"`
+	EmailVerified  bool   `json:"email_verified"`
+	Language       string `json:"language"`
 	jwt.RegisteredClaims
 }
 
-func GenerateToken(userID int, email, name string, avatar string, token string, bio string, is_verified bool, following_count uint, follow_count uint) (string, error) {
+func GenerateToken(userID uint, email, name, username, avatar, token, bio, website, phone, language string, is_verified, privacy, email_verified bool, following_count, follower_count int) (string, error) {
 	claims := Claims{
 		UserID:         userID,
 		Email:          email,
 		Name:           name,
+		Username:       username,
 		Avatar:         avatar,
 		JWTToken:       token,
 		Bio:            bio,
-		FollowerCount:  follow_count,
+		Website:        website,
+		Phone:          phone,
+		FollowerCount:  follower_count,
 		FollowingCount: following_count,
 		IsVerified:     is_verified,
+		Privacy:        privacy,
+		EmailVerified:  email_verified,
+		Language:       language,
 
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
@@ -45,7 +57,6 @@ func GenerateToken(userID int, email, name string, avatar string, token string, 
 	jwtToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return jwtToken.SignedString(secretKey)
 }
-
 func ValidateToken(tokenString string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		return secretKey, nil
